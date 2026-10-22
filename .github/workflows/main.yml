@@ -1,7 +1,14 @@
 name: release
+
+# tag 推送 → 正式发布（Release + latest 镜像）
+# 定时 / 手动 → nightly 构建（prerelease + nightly 镜像）
 on:
   push:
     tags: ["v*"]
+  schedule:
+    # UTC 18:00 = 北京时间次日 02:00
+    - cron: "0 18 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write # 创建 Release 需要
@@ -48,11 +55,22 @@ jobs:
         with:
           name: web-dist
           path: server/webui/dist
+
+      # 区分 tag / 定时：tag 用 tag 名，否则生成 nightly 版本号
+      - name: Resolve build version
+        id: ver
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and package with build.sh
         env:
           ARTEX_TARGET_OS: ${{ matrix.goos }}
           ARTEX_TARGET_ARCH: ${{ matrix.goarch }}
-          ARTEX_BUILD_VERSION: ${{ github.ref_name }}
+          ARTEX_BUILD_VERSION: ${{ steps.ver.outputs.version }}
           ARTEX_SKIP_FRONTEND: "1"
           ARTEX_SKIP_NPM_CI: "1"
           # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
@@ -77,10 +95,20 @@ jobs:
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
   # ③ 汇总所有 zip → 创建 GitHub Release
+  #    tag 触发：正式 Release；定时触发：固定 nightly tag 的 prerelease（反复覆盖）
   release:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=nightly" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           pattern: pkg-*
@@ -91,6 +119,10 @@ jobs:
         run: sha256sum *.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Nightly' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          overwrite_files: true
           files: |
             dist/*.zip
             dist/SHA256SUMS
@@ -98,6 +130,7 @@ jobs:
 
   # ④ 多架构镜像 → 推 Docker Hub（复用 binaries 编好的 Linux 二进制，
   #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
+  #    tag 触发：推 v* + latest；定时触发：只推 nightly
   docker:
     needs: binaries
     runs-on: ubuntu-latest
@@ -123,7 +156,8 @@ jobs:
           images: autumn27/artex
           tags: |
             type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=nightly,enable=${{ github.ref_type != 'tag' }}
       - uses: docker/build-push-action@v6
         with:
           context: .
